@@ -1,3 +1,4 @@
+
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using MobileI2VConsole.Models;
@@ -39,13 +40,20 @@ public partial class HomeViewModel : ObservableObject
 
     public bool IsDownloadNeeded => !IsModelDownloaded;
 
-    partial void OnIsModelDownloadedChanged(bool value) => OnPropertyChanged(nameof(IsDownloadNeeded));
+    partial void OnIsModelDownloadedChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsDownloadNeeded));
+    }
 
-    public HomeViewModel(IMediaPickerService mediaPicker, IFileService fileService, IModelManager modelManager)
+    public HomeViewModel(
+        IMediaPickerService mediaPicker,
+        IFileService fileService,
+        IModelManager modelManager)
     {
         _mediaPicker = mediaPicker;
         _fileService = fileService;
         _modelManager = modelManager;
+
         LoadPromptTemplates();
         _ = CheckAndExtractModelsAsync();
     }
@@ -62,27 +70,41 @@ public partial class HomeViewModel : ObservableObject
     {
         try
         {
-            // Try loading from embedded resource
-            var assembly = typeof(HomeViewModel).Assembly;
-            using var stream = FileSystem.OpenAppPackageFileAsync("PromptTemplates.json").Result;
-            if (stream != null)
+            using var stream =
+                FileSystem.OpenAppPackageFileAsync("PromptTemplates.json")
+                    .GetAwaiter().GetResult();
+
+            using var reader = new StreamReader(stream);
+            var json = reader.ReadToEnd();
+
+            var templates =
+                JsonSerializer.Deserialize<List<PromptTemplate>>(json);
+
+            if (templates != null)
             {
-                using var reader = new StreamReader(stream);
-                var json = reader.ReadToEnd();
-                var templates = JsonSerializer.Deserialize<List<PromptTemplate>>(json);
-                if (templates != null)
-                {
-                    PromptTemplates.Clear();
-                    foreach (var t in templates)
-                        PromptTemplates.Add(t);
-                }
+                PromptTemplates.Clear();
+
+                foreach (var template in templates)
+                    PromptTemplates.Add(template);
             }
         }
-        catch(Exception ex)
+        catch
         {
-            // Fallback defaults
-            PromptTemplates.Add(new PromptTemplate { Name = "Gentle Motion", Prompt = "gentle motion, smooth and subtle movement", Icon = "🌊" });
-            PromptTemplates.Add(new PromptTemplate { Name = "Cinematic Pan", Prompt = "cinematic panning shot, slow camera movement", Icon = "🎬" });
+            PromptTemplates.Clear();
+
+            PromptTemplates.Add(new PromptTemplate
+            {
+                Name = "Gentle Motion",
+                Prompt = "gentle motion, smooth and subtle movement",
+                Icon = "🌊"
+            });
+
+            PromptTemplates.Add(new PromptTemplate
+            {
+                Name = "Cinematic Pan",
+                Prompt = "cinematic panning shot, slow camera movement",
+                Icon = "🎬"
+            });
         }
     }
 
@@ -90,20 +112,18 @@ public partial class HomeViewModel : ObservableObject
     private async Task PickImageAsync()
     {
         var result = await _mediaPicker.PickImageAsync();
+
         if (result != null)
-        {
             SelectedImagePath = result.FullPath;
-        }
     }
 
     [RelayCommand]
     private async Task CaptureImageAsync()
     {
         var result = await _mediaPicker.CaptureImageAsync();
+
         if (result != null)
-        {
             SelectedImagePath = result.FullPath;
-        }
     }
 
     [RelayCommand]
@@ -115,25 +135,47 @@ public partial class HomeViewModel : ObservableObject
     [RelayCommand]
     private async Task DownloadModelsAsync()
     {
+        if (IsDownloading)
+            return;
+
         IsDownloading = true;
-        DownloadStatusText = "Downloading models...";
+        DownloadProgress = 0;
+        DownloadStatusText = "Preparing models...";
+
         try
         {
             var progress = new Progress<ModelStatus>(status =>
             {
                 DownloadProgress = status.DownloadProgress;
-                DownloadStatusText = $"Downloading {status.ModelName}... {status.DownloadProgress:P0}";
+                DownloadStatusText =
+                    $"Downloading {status.ModelName}... {status.DownloadProgress:P0}";
             });
 
-            var success = true;// all models are bundled in assets, so no download is needed. //await _modelManager.DownloadModelsAsync(progress);
-            if (success)
+            var success = await _modelManager.DownloadModelsAsync(
+                progress,
+                CancellationToken.None);
+
+            var statuses = _modelManager.GetAllStatus();
+
+            IsModelDownloaded =
+                success &&
+                statuses.Count > 0 &&
+                statuses.All(status => status.IsDownloaded);
+
+            if (IsModelDownloaded)
             {
-                IsModelDownloaded = true;
+                DownloadProgress = 1.0;
                 DownloadStatusText = "All models ready";
+            }
+            else
+            {
+                DownloadStatusText =
+                    "Some models are missing. Please try again.";
             }
         }
         catch (Exception ex)
         {
+            IsModelDownloaded = false;
             DownloadStatusText = $"Download failed: {ex.Message}";
         }
         finally
@@ -147,14 +189,21 @@ public partial class HomeViewModel : ObservableObject
     {
         if (string.IsNullOrEmpty(SelectedImagePath))
         {
-            await Shell.Current.DisplayAlert("No Image", "Please select an image first.", "OK");
+            await Shell.Current.DisplayAlert(
+                "No Image",
+                "Please select an image first.",
+                "OK");
+
             return;
         }
 
         if (!IsModelDownloaded)
         {
-            await Shell.Current.DisplayAlert("Models Not Ready", 
-                "Please download the AI models first.", "OK");
+            await Shell.Current.DisplayAlert(
+                "Models Not Ready",
+                "Please download the AI models first.",
+                "OK");
+
             return;
         }
 
@@ -170,10 +219,13 @@ public partial class HomeViewModel : ObservableObject
         };
 
         var serialized = JsonSerializer.Serialize(request);
-        await Shell.Current.GoToAsync("generation", new Dictionary<string, object>
-        {
-            ["Request"] = serialized
-        });
+
+        await Shell.Current.GoToAsync(
+            "generation",
+            new Dictionary<string, object>
+            {
+                ["Request"] = serialized
+            });
     }
 
     [RelayCommand]
@@ -184,32 +236,31 @@ public partial class HomeViewModel : ObservableObject
 
     private async Task CheckAndExtractModelsAsync()
     {
-        var statuses = _modelManager.GetAllStatus();
-        if (statuses.All(s => s.IsDownloaded))
-        {
-            IsModelDownloaded = true;
-            DownloadStatusText = "All models ready";
+        if (IsDownloading)
             return;
-        }
 
-        // Try extracting bundled models from app package (Resources/Raw)
-        DownloadStatusText = "Extracting bundled models...";
         try
         {
-            var success = await _modelManager.DownloadModelsAsync(null);
-            if (success)
+            var statuses = _modelManager.GetAllStatus();
+
+            if (statuses.Count > 0 &&
+                statuses.All(status => status.IsDownloaded))
             {
                 IsModelDownloaded = true;
                 DownloadStatusText = "All models ready";
+                return;
             }
-            else
-            {
-                DownloadStatusText = "Models need to be downloaded";
-            }
+
+            IsModelDownloaded = false;
+            DownloadStatusText = "Checking bundled models...";
+
+            // Copy bundled models if available; otherwise download them.
+            await DownloadModelsAsync();
         }
-        catch
+        catch (Exception ex)
         {
-            DownloadStatusText = "Models need to be downloaded";
+            IsModelDownloaded = false;
+            DownloadStatusText = $"Models unavailable: {ex.Message}";
         }
     }
 }
