@@ -6,7 +6,7 @@
              x:DataType="vm:GenerationViewModel"
              Title="Generating..."
              Shell.NavBarIsVisible="False"
-             BackgroundColor="{StaticResource PageBackgroundColor}">
+             BackgroundColor="#121212"
 
     <VerticalStackLayout Spacing="25" Padding="30" VerticalOptions="Center">
 
