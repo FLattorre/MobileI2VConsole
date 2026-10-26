@@ -1,3 +1,4 @@
+
 using Microsoft.Maui.Storage;
 using Microsoft.ML.OnnxRuntime;
 using MobileI2VConsole.Models;
@@ -20,7 +21,7 @@ public class ModelManagerService : IModelManager, IDisposable
     private Dictionary<string, ModelManifestEntry>? _manifest;
 
     // Model registry
-    private static readonly ModelInfo[] Models = new[]
+    private static readonly ModelInfo[] Models =
     {
         new ModelInfo("vae_encoder.onnx", "https://huggingface.co/hustvl/MobileI2V/resolve/main/vae_encoder.onnx", 1),
         new ModelInfo("qwen2_encoder.onnx", "https://huggingface.co/hustvl/MobileI2V/resolve/main/qwen2_encoder.onnx", 2),
@@ -34,52 +35,78 @@ public class ModelManagerService : IModelManager, IDisposable
     public ModelManagerService(IFileService fileService)
     {
         _fileService = fileService;
-        _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
+        _httpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromMinutes(30)
+        };
 
-        // Initialize status entries
+        // Models are not considered downloaded until their files are verified.
         foreach (var model in Models)
         {
             _status[model.Name] = new ModelStatus
             {
                 ModelName = model.Name,
                 DownloadProgress = 0,
-                IsDownloaded = true,
+                IsDownloaded = false,
                 IsLoaded = false
             };
         }
     }
 
-    public async Task<bool> DownloadModelsAsync(IProgress<ModelStatus>? progress, CancellationToken ct)
+    public async Task<bool> DownloadModelsAsync(
+        IProgress<ModelStatus>? progress,
+        CancellationToken ct)
     {
         await _fileService.InitializeAsync();
-        var modelsDir = _fileService.GetModelsDirectory();
 
-        // First download manifest
+        var modelsDir = _fileService.GetModelsDirectory();
+        Directory.CreateDirectory(modelsDir);
+
+        // Download the manifest first, if available.
         await DownloadManifestAsync(modelsDir, ct);
 
         foreach (var model in Models.OrderBy(m => m.Order))
         {
             ct.ThrowIfCancellationRequested();
+
             var targetPath = Path.Combine(modelsDir, model.Name);
 
+            // Reuse an existing non-empty model file.
+            if (File.Exists(targetPath) && new FileInfo(targetPath).Length > 0)
+            {
+                var existingStatus = _status[model.Name] with
+                {
+                    IsDownloaded = true,
+                    DownloadProgress = 1.0
+                };
+
+                _status[model.Name] = existingStatus;
+                progress?.Report(existingStatus);
+                continue;
+            }
+
+            // Remove an empty or incomplete destination file.
             if (File.Exists(targetPath))
             {
-                var status = _status[model.Name] with { IsDownloaded = true, DownloadProgress = 1.0 };
-                _status[model.Name] = status;
-                progress?.Report(status);
-                continue;
+                try { File.Delete(targetPath); } catch { }
             }
 
-            // If not already downloaded, try extracting from app package (Resources/Raw)
-            if (await TryCopyFromAppPackageAsync(model.Name, targetPath, ct).ConfigureAwait(false))
+            // Try to copy the model from the application package.
+            if (await TryCopyFromAppPackageAsync(model.Name, targetPath, ct)
+                    .ConfigureAwait(false))
             {
-                var appStatus = _status[model.Name] with { IsDownloaded = true, DownloadProgress = 1.0 };
-                _status[model.Name] = appStatus;
-                progress?.Report(appStatus);
+                var packageStatus = _status[model.Name] with
+                {
+                    IsDownloaded = true,
+                    DownloadProgress = 1.0
+                };
+
+                _status[model.Name] = packageStatus;
+                progress?.Report(packageStatus);
                 continue;
             }
 
-            // Download with progress and retry
+            // Download the model, with retries.
             var tempPath = targetPath + ".tmp";
             const int maxRetries = 3;
             var attempt = 0;
@@ -88,98 +115,179 @@ public class ModelManagerService : IModelManager, IDisposable
             while (!success && attempt < maxRetries)
             {
                 attempt++;
+
                 try
                 {
-                    using var response = await _httpClient.GetAsync(model.Url, HttpCompletionOption.ResponseHeadersRead, ct);
-                    response.EnsureSuccessStatusCode();
-                    var total = response.Content.Headers.ContentLength ?? -1;
-                    using var stream = await response.Content.ReadAsStreamAsync(ct);
-                    using var fileStream = File.Create(tempPath);
+                    using var response = await _httpClient.GetAsync(
+                        model.Url,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        ct);
 
-                    var buffer = new byte[81920];
-                    long bytesRead = 0;
-                    int read;
-                    while ((read = await stream.ReadAsync(buffer, ct)) > 0)
+                    response.EnsureSuccessStatusCode();
+
+                    var total = response.Content.Headers.ContentLength ?? -1;
+
+                    using var stream = await response.Content.ReadAsStreamAsync(ct);
+                    using (var fileStream = File.Create(tempPath))
                     {
-                        await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
-                        bytesRead += read;
-                        if (total > 0)
+                        var buffer = new byte[81920];
+                        long bytesRead = 0;
+                        int read;
+
+                        while ((read = await stream.ReadAsync(buffer, ct)) > 0)
                         {
-                            var pct = (double)bytesRead / total;
-                            var status = _status[model.Name] with { DownloadProgress = pct };
-                            _status[model.Name] = status;
-                            progress?.Report(status);
+                            await fileStream.WriteAsync(
+                                buffer.AsMemory(0, read), ct);
+
+                            bytesRead += read;
+
+                            if (total > 0)
+                            {
+                                var pct = (double)bytesRead / total;
+
+                                var downloadStatus = _status[model.Name] with
+                                {
+                                    DownloadProgress = Math.Min(pct, 1.0)
+                                };
+
+                                _status[model.Name] = downloadStatus;
+                                progress?.Report(downloadStatus);
+                            }
                         }
                     }
 
-                    // Verify SHA256
-                    if (_manifest?.TryGetValue(model.Name, out var entry) == true && !string.IsNullOrEmpty(entry.Sha256))
+                    // Reject empty downloads.
+                    if (!File.Exists(tempPath) ||
+                        new FileInfo(tempPath).Length == 0)
+                    {
+                        throw new InvalidDataException(
+                            $"Downloaded model is empty: {model.Name}");
+                    }
+
+                    // Verify SHA256 when the manifest supplies a hash.
+                    if (_manifest?.TryGetValue(model.Name, out var entry) == true &&
+                        !string.IsNullOrEmpty(entry.Sha256))
                     {
                         var hash = await ComputeSha256Async(tempPath);
-                        if (!string.Equals(hash, entry.Sha256, StringComparison.OrdinalIgnoreCase))
+
+                        if (!string.Equals(
+                            hash,
+                            entry.Sha256,
+                            StringComparison.OrdinalIgnoreCase))
                         {
                             File.Delete(tempPath);
-                            throw new InvalidDataException($"SHA256 mismatch for {model.Name}");
+
+                            throw new InvalidDataException(
+                                $"SHA256 mismatch for {model.Name}");
                         }
                     }
 
                     File.Move(tempPath, targetPath, overwrite: true);
 
-                    var doneStatus = _status[model.Name] with { IsDownloaded = true, DownloadProgress = 1.0 };
+                    var doneStatus = _status[model.Name] with
+                    {
+                        IsDownloaded = true,
+                        DownloadProgress = 1.0
+                    };
+
                     _status[model.Name] = doneStatus;
                     progress?.Report(doneStatus);
                     success = true;
                 }
                 catch (OperationCanceledException)
                 {
-                    if (File.Exists(tempPath)) File.Delete(tempPath);
+                    if (File.Exists(tempPath))
+                        File.Delete(tempPath);
+
                     throw;
                 }
                 catch
                 {
-                    if (File.Exists(tempPath)) File.Delete(tempPath);
+                    if (File.Exists(tempPath))
+                        File.Delete(tempPath);
+
                     if (attempt >= maxRetries)
                         throw;
-                    // Brief delay before retry
+
                     await Task.Delay(1000 * attempt, ct);
                 }
             }
         }
+
         return true;
     }
 
-    public async Task<bool> LoadModelAsync(string modelName, CancellationToken ct)
+    public async Task<bool> LoadModelAsync(
+        string modelName,
+        CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
+
         if (_sessions.ContainsKey(modelName))
             return true;
 
         var modelPath = await GetModelPathAsync(modelName);
-        if (!File.Exists(modelPath))
+
+        if (!File.Exists(modelPath) ||
+            new FileInfo(modelPath).Length == 0)
+        {
+            _status[modelName] = _status[modelName] with
+            {
+                IsDownloaded = false,
+                IsLoaded = false
+            };
+
             return false;
+        }
 
         if (_ortEnv == null || _ortEnv.IsInvalid)
             _ortEnv = OrtEnv.Instance();
-        var opts = new SessionOptions();
 
-        // Try to enable NNAPI for hardware acceleration
-        try { opts.AppendExecutionProvider_Nnapi(/* nnapiFlags */ 0); } catch { /* fall back to CPU */ }
+        using var opts = new SessionOptions();
 
-        var session = new InferenceSession(modelPath, opts);
+        // Try NNAPI hardware acceleration; fall back to CPU if unavailable.
+        try
+        {
+            opts.AppendExecutionProvider_Nnapi(0);
+        }
+        catch
+        {
+            // CPU execution remains available.
+        }
 
-        // Force early validation to detect corrupt model files
-        try { _ = session.InputMetadata; }
+        InferenceSession session;
+
+        try
+        {
+            session = new InferenceSession(modelPath, opts);
+
+            // Validate the model before registering the session.
+            _ = session.InputMetadata;
+        }
         catch (OnnxRuntimeException ex)
         {
-            Console.Error.WriteLine($"Corrupt model detected: {modelName} - {ex.Message}. Deleting and will re-download.");
-            session.Dispose();
+            Console.Error.WriteLine(
+                $"Unable to load model {modelName}: {ex.Message}");
+
             try { File.Delete(modelPath); } catch { }
-            _status[modelName] = _status[modelName] with { IsLoaded = false, IsDownloaded = false };
+
+            _status[modelName] = _status[modelName] with
+            {
+                IsLoaded = false,
+                IsDownloaded = false
+            };
+
             return false;
         }
 
         _sessions[modelName] = session;
 
-        _status[modelName] = _status[modelName] with { IsLoaded = true };
+        _status[modelName] = _status[modelName] with
+        {
+            IsDownloaded = true,
+            IsLoaded = true
+        };
+
         return true;
     }
 
@@ -188,49 +296,80 @@ public class ModelManagerService : IModelManager, IDisposable
         if (_sessions.TryRemove(modelName, out var session))
         {
             session.Dispose();
-            _status[modelName] = _status[modelName] with { IsLoaded = false };
+
+            if (_status.TryGetValue(modelName, out var status))
+            {
+                _status[modelName] = status with
+                {
+                    IsLoaded = false
+                };
+            }
         }
+
         return Task.CompletedTask;
     }
 
     public bool IsModelDownloaded(string modelName) =>
-        _status.TryGetValue(modelName, out var s) && s.IsDownloaded;
+        _status.TryGetValue(modelName, out var status) &&
+        status.IsDownloaded;
 
     public bool IsModelLoaded(string modelName) =>
-        _status.TryGetValue(modelName, out var s) && s.IsLoaded;
+        _status.TryGetValue(modelName, out var status) &&
+        status.IsLoaded;
 
-    public bool TryGetSession(string modelName, out InferenceSession session) =>
-        _sessions.TryGetValue(modelName, out session);
+    public bool TryGetSession(
+        string modelName,
+        out InferenceSession session) =>
+        _sessions.TryGetValue(modelName, out session!);
 
     public async Task<string> GetModelPathAsync(string modelName)
     {
-        var cachePath = Path.Combine(FileSystem.CacheDirectory, modelName);
+        await _fileService.InitializeAsync();
 
-        if (!File.Exists(cachePath))
+        var modelsDir = _fileService.GetModelsDirectory();
+        Directory.CreateDirectory(modelsDir);
+
+        var modelPath = Path.Combine(modelsDir, modelName);
+
+        // Use the same directory as DownloadModelsAsync.
+        if (File.Exists(modelPath) &&
+            new FileInfo(modelPath).Length > 0)
         {
-            using var asset = await FileSystem.OpenAppPackageFileAsync(modelName);
-            using var file = File.Create(cachePath);
+            return modelPath;
+        }
+
+        // If the model is bundled with the app, copy it into the models folder.
+        if (await FileSystem.AppPackageFileExistsAsync(modelName))
+        {
+            using var asset =
+                await FileSystem.OpenAppPackageFileAsync(modelName);
+
+            using var file = File.Create(modelPath);
             await asset.CopyToAsync(file);
         }
 
-        return cachePath;
-        //Path.Combine(_fileService.GetModelsDirectory(), modelName);
+        return modelPath;
     }
 
-    // Synchronous wrapper used in unit tests / legacy callers
+    // Synchronous wrapper used in unit tests / legacy callers.
     public string GetModelPath(string modelName)
     {
-        return Path.Combine(FileSystem.CacheDirectory, modelName);
+        return Path.Combine(
+            _fileService.GetModelsDirectory(),
+            modelName);
     }
 
     public IReadOnlyList<ModelStatus> GetAllStatus() =>
-        Models.Select(m => _status.GetValueOrDefault(m.Name, new ModelStatus
-        {
-            ModelName = m.Name,
-            DownloadProgress = 0,
-            IsDownloaded = false,
-            IsLoaded = false
-        })).ToList().AsReadOnly();
+        Models.Select(model =>
+            _status.GetValueOrDefault(model.Name, new ModelStatus
+            {
+                ModelName = model.Name,
+                DownloadProgress = 0,
+                IsDownloaded = false,
+                IsLoaded = false
+            }))
+        .ToList()
+        .AsReadOnly();
 
     public async Task ClearCacheAsync()
     {
@@ -238,7 +377,9 @@ public class ModelManagerService : IModelManager, IDisposable
         {
             await UnloadModelAsync(model.Name);
         }
+
         var dir = _fileService.GetModelsDirectory();
+
         if (Directory.Exists(dir))
         {
             foreach (var file in Directory.GetFiles(dir))
@@ -246,9 +387,15 @@ public class ModelManagerService : IModelManager, IDisposable
                 try { File.Delete(file); } catch { }
             }
         }
+
         foreach (var model in Models)
         {
-            _status[model.Name] = _status[model.Name] with { IsDownloaded = false, DownloadProgress = 0, IsLoaded = false };
+            _status[model.Name] = _status[model.Name] with
+            {
+                IsDownloaded = false,
+                DownloadProgress = 0,
+                IsLoaded = false
+            };
         }
     }
 
@@ -256,14 +403,93 @@ public class ModelManagerService : IModelManager, IDisposable
     {
         foreach (var session in _sessions.Values)
             session.Dispose();
+
         _sessions.Clear();
         _httpClient.Dispose();
     }
 
-    private async Task<bool> TryCopyFromAppPackageAsync(string modelName, string targetPath, CancellationToken ct)
+    private async Task<bool> TryCopyFromAppPackageAsync(
+        string modelName,
+        string targetPath,
+        CancellationToken ct)
     {
         try
         {
+            if (!await FileSystem.AppPackageFileExistsAsync(modelName)
+                    .ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            using var packageStream =
+                await FileSystem.OpenAppPackageFileAsync(modelName)
+                    .ConfigureAwait(false);
+
+            using var fileStream = File.Create(targetPath);
+
+            await packageStream.CopyToAsync(fileStream, ct)
+                .ConfigureAwait(false);
+
+            return fileStream.Length > 0;
+        }
+        catch (FileNotFoundException)
+        {
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                if (File.Exists(targetPath))
+                    File.Delete(targetPath);
+            }
+            catch { }
+
+            throw;
+        }
+    }
+
+    private static async Task<string> ComputeSha256Async(string filePath)
+    {
+        using var stream = File.OpenRead(filePath);
+        using var sha256 = SHA256.Create();
+
+        var hash = await sha256.ComputeHashAsync(stream);
+
+        return Convert.ToHexStringLower(hash);
+    }
+
+    private async Task DownloadManifestAsync(
+        string modelsDir,
+        CancellationToken ct)
+    {
+        var manifestUrl =
+            "https://huggingface.co/hustvl/MobileI2V/resolve/main/models_manifest.json";
+
+        try
+        {
+            var json = await _httpClient.GetStringAsync(manifestUrl, ct);
+
+            var entries =
+                JsonSerializer.Deserialize<Dictionary<string, ModelManifestEntry>>(
+                    json);
+
+            _manifest = entries;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Manifest unavailable: continue without SHA256 verification.
+            _manifest = null;
+        }
+    }
+}
+ {
             if (!await FileSystem.AppPackageFileExistsAsync(modelName).ConfigureAwait(false))
                 return false;
 
