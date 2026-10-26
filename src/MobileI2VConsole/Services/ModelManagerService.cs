@@ -231,11 +231,14 @@ public class ModelManagerService : IModelManager, IDisposable
         if (!File.Exists(modelPath) ||
             new FileInfo(modelPath).Length == 0)
         {
-            _status[modelName] = _status[modelName] with
+            if (_status.TryGetValue(modelName, out var missingStatus))
             {
-                IsDownloaded = false,
-                IsLoaded = false
-            };
+                _status[modelName] = missingStatus with
+                {
+                    IsDownloaded = false,
+                    IsLoaded = false
+                };
+            }
 
             return false;
         }
@@ -271,22 +274,34 @@ public class ModelManagerService : IModelManager, IDisposable
 
             try { File.Delete(modelPath); } catch { }
 
-            _status[modelName] = _status[modelName] with
+            if (_status.TryGetValue(modelName, out var invalidStatus))
             {
-                IsLoaded = false,
-                IsDownloaded = false
-            };
+                _status[modelName] = invalidStatus with
+                {
+                    IsLoaded = false,
+                    IsDownloaded = false
+                };
+            }
 
             return false;
         }
 
         _sessions[modelName] = session;
 
-        _status[modelName] = _status[modelName] with
+        if (_status.TryGetValue(modelName, out var loadedStatus))
         {
-            IsDownloaded = true,
-            IsLoaded = true
-        };
+            _status[modelName] = loadedStatus with
+            {
+                IsDownloaded = true,
+                IsLoaded = true
+            };
+        }
+        else
+        {
+            session.Dispose();
+            _sessions.TryRemove(modelName, out _);
+            return false;
+        }
 
         return true;
     }
@@ -310,6 +325,186 @@ public class ModelManagerService : IModelManager, IDisposable
     }
 
     public bool IsModelDownloaded(string modelName) =>
+        _status.TryGetValue(modelName, out var status) &&
+        status.IsDownloaded;
+
+    public bool IsModelLoaded(string modelName) =>
+        _status.TryGetValue(modelName, out var status) &&
+        status.IsLoaded;
+
+    public bool TryGetSession(
+        string modelName,
+        out InferenceSession session) =>
+        _sessions.TryGetValue(modelName, out session!);
+
+    public async Task<string> GetModelPathAsync(string modelName)
+    {
+        await _fileService.InitializeAsync();
+
+        var modelsDir = _fileService.GetModelsDirectory();
+        Directory.CreateDirectory(modelsDir);
+
+        var modelPath = Path.Combine(modelsDir, modelName);
+
+        // Use the same directory as DownloadModelsAsync.
+        if (File.Exists(modelPath) &&
+            new FileInfo(modelPath).Length > 0)
+        {
+            return modelPath;
+        }
+
+        // If the model is bundled with the app, copy it into the models folder.
+        if (await FileSystem.AppPackageFileExistsAsync(modelName))
+        {
+            using var asset =
+                await FileSystem.OpenAppPackageFileAsync(modelName);
+
+            using var file = File.Create(modelPath);
+            await asset.CopyToAsync(file);
+        }
+
+        return modelPath;
+    }
+
+    // Synchronous wrapper used in unit tests / legacy callers.
+    public string GetModelPath(string modelName)
+    {
+        return Path.Combine(
+            _fileService.GetModelsDirectory(),
+            modelName);
+    }
+
+    public IReadOnlyList<ModelStatus> GetAllStatus() =>
+        Models.Select(model =>
+            _status.GetValueOrDefault(model.Name, new ModelStatus
+            {
+                ModelName = model.Name,
+                DownloadProgress = 0,
+                IsDownloaded = false,
+                IsLoaded = false
+            }))
+        .ToList()
+        .AsReadOnly();
+
+    public async Task ClearCacheAsync()
+    {
+        foreach (var model in Models)
+        {
+            await UnloadModelAsync(model.Name);
+        }
+
+        var dir = _fileService.GetModelsDirectory();
+
+        if (Directory.Exists(dir))
+        {
+            foreach (var file in Directory.GetFiles(dir))
+            {
+                try { File.Delete(file); } catch { }
+            }
+        }
+
+        foreach (var model in Models)
+        {
+            _status[model.Name] = _status[model.Name] with
+            {
+                IsDownloaded = false,
+                DownloadProgress = 0,
+                IsLoaded = false
+            };
+        }
+    }
+
+    public void Dispose()
+    {
+        foreach (var session in _sessions.Values)
+            session.Dispose();
+
+        _sessions.Clear();
+        _httpClient.Dispose();
+    }
+
+    private async Task<bool> TryCopyFromAppPackageAsync(
+        string modelName,
+        string targetPath,
+        CancellationToken ct)
+    {
+        try
+        {
+            if (!await FileSystem.AppPackageFileExistsAsync(modelName)
+                    .ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            using var packageStream =
+                await FileSystem.OpenAppPackageFileAsync(modelName)
+                    .ConfigureAwait(false);
+
+            using var fileStream = File.Create(targetPath);
+
+            await packageStream.CopyToAsync(fileStream, ct)
+                .ConfigureAwait(false);
+
+            return fileStream.Length > 0;
+        }
+        catch (FileNotFoundException)
+        {
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                if (File.Exists(targetPath))
+                    File.Delete(targetPath);
+            }
+            catch { }
+
+            throw;
+        }
+    }
+
+    private static async Task<string> ComputeSha256Async(string filePath)
+    {
+        using var stream = File.OpenRead(filePath);
+        using var sha256 = SHA256.Create();
+
+        var hash = await sha256.ComputeHashAsync(stream);
+
+        return Convert.ToHexStringLower(hash);
+    }
+
+    private async Task DownloadManifestAsync(
+        string modelsDir,
+        CancellationToken ct)
+    {
+        var manifestUrl =
+            "https://huggingface.co/hustvl/MobileI2V/resolve/main/models_manifest.json";
+
+        try
+        {
+            var json = await _httpClient.GetStringAsync(manifestUrl, ct);
+
+            var entries =
+                JsonSerializer.Deserialize<Dictionary<string, ModelManifestEntry>>(
+                    json);
+
+            _manifest = entries;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Manifest unavailable: continue without SHA256 verification.
+            _manifest = null;
+        }
+    }
+}
+elName) =>
         _status.TryGetValue(modelName, out var status) &&
         status.IsDownloaded;
 
